@@ -15,9 +15,10 @@
  */
 package io.netty.channel;
 
-import io.netty.util.Recycler;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.PromiseCombiner;
+import io.netty.util.internal.ObjectPool;
+import io.netty.util.internal.ObjectPool.ObjectCreator;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -38,7 +39,7 @@ public final class PendingWriteQueue {
             SystemPropertyUtil.getInt("io.netty.transport.pendingWriteSizeOverhead", 64);
 
     private final ChannelHandlerContext ctx;
-    private final PendingTracker tracker;
+    private final PendingBytesTracker tracker;
 
     // head and tail pointers for the linked-list structure. If empty head and tail are null.
     private PendingWrite head;
@@ -46,80 +47,9 @@ public final class PendingWriteQueue {
     private int size;
     private long bytes;
 
-    private interface PendingTracker extends MessageSizeEstimator.Handle {
-        void incrementPendingOutboundBytes(long bytes);
-        void decrementPendingOutboundBytes(long bytes);
-    }
-
     public PendingWriteQueue(ChannelHandlerContext ctx) {
-        this.ctx = ObjectUtil.checkNotNull(ctx, "ctx");
-        if (ctx.pipeline() instanceof DefaultChannelPipeline) {
-            final DefaultChannelPipeline pipeline = (DefaultChannelPipeline) ctx.pipeline();
-            tracker = new PendingTracker() {
-                @Override
-                public void incrementPendingOutboundBytes(long bytes) {
-                    pipeline.incrementPendingOutboundBytes(bytes);
-                }
-
-                @Override
-                public void decrementPendingOutboundBytes(long bytes) {
-                    pipeline.decrementPendingOutboundBytes(bytes);
-                }
-
-                @Override
-                public int size(Object msg) {
-                    return pipeline.estimatorHandle().size(msg);
-                }
-            };
-        } else {
-            final MessageSizeEstimator.Handle estimator = ctx.channel().config().getMessageSizeEstimator().newHandle();
-            final ChannelOutboundBuffer buffer = ctx.channel().unsafe().outboundBuffer();
-            if (buffer == null) {
-                tracker = new PendingTracker() {
-                    @Override
-                    public void incrementPendingOutboundBytes(long bytes) {
-                        // noop
-                    }
-
-                    @Override
-                    public void decrementPendingOutboundBytes(long bytes) {
-                        // noop
-                    }
-
-                    @Override
-                    public int size(Object msg) {
-                        return estimator.size(msg);
-                    }
-                };
-            } else {
-                tracker = new PendingTracker() {
-                    @Override
-                    public void incrementPendingOutboundBytes(long bytes) {
-                        // We need to guard against null as channel.unsafe().outboundBuffer() may returned null
-                        // if the channel was already closed when constructing the PendingWriteQueue.
-                        // See https://github.com/netty/netty/issues/3967
-                        if (buffer != null) {
-                            buffer.incrementPendingOutboundBytes(bytes);
-                        }
-                    }
-
-                    @Override
-                    public void decrementPendingOutboundBytes(long bytes) {
-                        // We need to guard against null as channel.unsafe().outboundBuffer() may returned null
-                        // if the channel was already closed when constructing the PendingWriteQueue.
-                        // See https://github.com/netty/netty/issues/3967
-                        if (buffer != null) {
-                            buffer.decrementPendingOutboundBytes(bytes);
-                        }
-                    }
-
-                    @Override
-                    public int size(Object msg) {
-                        return estimator.size(msg);
-                    }
-                };
-            }
-        }
+        tracker = PendingBytesTracker.newTracker(ctx.channel());
+        this.ctx = ctx;
     }
 
     /**
@@ -163,12 +93,8 @@ public final class PendingWriteQueue {
      */
     public void add(Object msg, ChannelPromise promise) {
         assert ctx.executor().inEventLoop();
-        if (msg == null) {
-            throw new NullPointerException("msg");
-        }
-        if (promise == null) {
-            throw new NullPointerException("promise");
-        }
+        ObjectUtil.checkNotNull(msg, "msg");
+        ObjectUtil.checkNotNull(promise, "promise");
         // It is possible for writes to be triggered from removeAndFailAll(). To preserve ordering,
         // we should add them to the queue and let removeAndFailAll() fail them later.
         int messageSize = size(msg);
@@ -201,7 +127,7 @@ public final class PendingWriteQueue {
         }
 
         ChannelPromise p = ctx.newPromise();
-        PromiseCombiner combiner = new PromiseCombiner();
+        PromiseCombiner combiner = new PromiseCombiner(ctx.executor());
         try {
             // It is possible for some of the written promises to trigger more writes. The new writes
             // will "revive" the queue, so we need to write them up until the queue is empty.
@@ -215,7 +141,9 @@ public final class PendingWriteQueue {
                     Object msg = write.msg;
                     ChannelPromise promise = write.promise;
                     recycle(write, false);
-                    combiner.add(promise);
+                    if (!(promise instanceof VoidChannelPromise)) {
+                        combiner.add(promise);
+                    }
                     ctx.write(msg, promise);
                     write = next;
                 }
@@ -234,9 +162,7 @@ public final class PendingWriteQueue {
      */
     public void removeAndFailAll(Throwable cause) {
         assert ctx.executor().inEventLoop();
-        if (cause == null) {
-            throw new NullPointerException("cause");
-        }
+        ObjectUtil.checkNotNull(cause, "cause");
         // It is possible for some of the failed promises to trigger more writes. The new writes
         // will "revive" the queue, so we need to clean them up until the queue is empty.
         for (PendingWrite write = head; write != null; write = head) {
@@ -261,11 +187,9 @@ public final class PendingWriteQueue {
      */
     public void removeAndFail(Throwable cause) {
         assert ctx.executor().inEventLoop();
-        if (cause == null) {
-            throw new NullPointerException("cause");
-        }
-        PendingWrite write = head;
+        ObjectUtil.checkNotNull(cause, "cause");
 
+        PendingWrite write = head;
         if (write == null) {
             return;
         }
@@ -361,20 +285,20 @@ public final class PendingWriteQueue {
      * Holds all meta-data and construct the linked-list structure.
      */
     static final class PendingWrite {
-        private static final Recycler<PendingWrite> RECYCLER = new Recycler<PendingWrite>() {
+        private static final ObjectPool<PendingWrite> RECYCLER = ObjectPool.newPool(new ObjectCreator<PendingWrite>() {
             @Override
-            protected PendingWrite newObject(Handle<PendingWrite> handle) {
+            public PendingWrite newObject(ObjectPool.Handle<PendingWrite> handle) {
                 return new PendingWrite(handle);
             }
-        };
+        });
 
-        private final Recycler.Handle<PendingWrite> handle;
+        private final ObjectPool.Handle<PendingWrite> handle;
         private PendingWrite next;
         private long size;
         private ChannelPromise promise;
         private Object msg;
 
-        private PendingWrite(Recycler.Handle<PendingWrite> handle) {
+        private PendingWrite(ObjectPool.Handle<PendingWrite> handle) {
             this.handle = handle;
         }
 
